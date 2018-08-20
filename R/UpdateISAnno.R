@@ -87,6 +87,7 @@ updateFAS <- function(baseUrl){
     message(paste0("Updating: ", nm))
     currAnno <- getAnno(nm, currFAS, baseUrl)
     orNm <- paste0(nm, "_orig")
+
     if( orNm %in% currFAS$Name ){
       message("Updating FAS")
       # if orig is present means that update has been performed at least once.
@@ -136,11 +137,21 @@ updateFAS <- function(baseUrl){
                                       folderPath = folderPath,
                                       schemaName = schemaName,
                                       queryName = "FeatureAnnotation",
+                                      colNameOpt = "fieldname",
+                                      colSelect = c("GeneSymbol", "FeatureId"),
                                       colFilter = makeFilter(c("FeatureAnnotationSetId",
                                                                "EQUALS",
                                                                unique(toImport$FeatureAnnotationSetId)))
                                       )
-      if( all.equal(featureChk, toImport) ){
+      featureChk[ is.na(featureChk) ] <- ""
+      featureChk <- featureChk[ order(featureChk$FeatureId), ]
+      imported <- data.frame(GeneSymbol = toImport$GeneSymbol,
+                             FeatureId = toImport$FeatureId,
+                             stringsAsFactors = FALSE)
+      imported <- imported[ order(imported$FeatureId), ]
+      rownames(imported) <- rownames(featureChk) <- NULL
+
+      if( all.equal(featureChk, imported) ){
         # Now update the old fasId rows with new geneSymbols
         currAnno$GeneSymbol <- updateAnno(currAnno$GeneSymbol)
         currAnno[ is.na(currAnno) ] <- ""
@@ -154,18 +165,17 @@ updateFAS <- function(baseUrl){
       }else{
         stop("Original FA not uploaded correctly to *_orig table")
       }
-
-      # Update FAS$comment to be packageVersion of org.Hs.eg.db
-      updateFAS <- data.frame(currFAS[ currFAS$Name == nm, ], stringsAsFactors = F)
-      updateFAS$Comment <- paste0("Alias2Symbol mapping with org.Hs.eg.db version: ",
-                                  UpdateAnno::orgHsEgDb_version)
-      FASdone <- labkey.updateRows(baseUrl = baseUrl,
-                                   folderPath = folderPath,
-                                   schemaName = schemaName,
-                                   queryName = "FeatureAnnotationSet",
-                                   toUpdate = updateFAS)
-
     }
+
+    # Update FAS$comment to be packageVersion of org.Hs.eg.db
+    updateFAS <- data.frame(currFAS[ currFAS$Name == nm, ], stringsAsFactors = F)
+    updateFAS$Comment <- paste0("Alias2Symbol mapping with org.Hs.eg.db version: ",
+                                UpdateAnno::orgHsEgDb_version)
+    FASdone <- labkey.updateRows(baseUrl = baseUrl,
+                                 folderPath = folderPath,
+                                 schemaName = schemaName,
+                                 queryName = "FeatureAnnotationSet",
+                                 toUpdate = updateFAS)
   })
   return(TRUE)
 }
@@ -182,13 +192,24 @@ updateFAS <- function(baseUrl){
 #' @export updateEMs
 updateEMs <- function(sdy, runsDF){
   print(paste0("working on study: ", sdy))
-  # get file basenames
+
+  # get file basenames present on server
   dirPath <- file.path("/share/files/Studies",
                        sdy,
                        "@files/analysis/exprs_matrices")
   fls <- list.files(dirPath)
   tmp <- unique(unlist(strsplit(fls, split = ".tsv", fixed = TRUE)))
-  baseNms <- tmp[ !(tmp %in% c(".summary",".orig",".summary.orig")) ]
+  baseNms <- tmp[ !(tmp %in% c(".summary",".summary.orig", ".raw", ".immsig")) ]
+
+  # checks
+  if(!all(baseNms %in% runsDF$name)){
+    baseNms <- baseNms[ baseNms %in% runsDF$name]
+    warning("Extra files / basenames present in current study.  Please delete.")
+  }
+
+  if( !(all(runsDF$name[ runsDF$folder_name == sdy] %in% baseNms))){
+    stop("Runs missing from files!")
+  }
 
   # go through each baseNm to update summary tsv
   sapply(baseNms, function(nm){
@@ -196,6 +217,7 @@ updateEMs <- function(sdy, runsDF){
     baseFls <- fls[ grep(nm, fls) ]
 
     # Rename original summary file to tsv.summary.orig if necessary (first time only)
+    # As of 7/2018, runCreateMatrix() is creating .summary.orig file at time of first run
     if( !(paste0(nm, ".tsv.summary.orig") %in% baseFls) ){
       sumFl <- paste0(dirPath, "/", nm, ".tsv.summary")
       dmp <- file.rename( sumFl, paste0(sumFl, ".orig") )
@@ -208,6 +230,19 @@ updateEMs <- function(sdy, runsDF){
     # because it is a lookup even though it is in microarray.FeatureAnnotation.
     prbEM <- fread(file.path(dirPath, paste0(nm, ".tsv")))
     annoSetId <- runsDF$featureset[ runsDF$name == nm ]
+    currFAS <- data.table(labkey.selectRows(baseUrl = baseUrl,
+                                                   folderPath = "/Studies/",
+                                                   schemaName = "microarray",
+                                                   queryName = "FeatureAnnotationSet",
+                                                   colNameOpt = "fieldname",
+                                                   showHidden = TRUE ))
+    currAnnoNm <- currFAS$Name[ currFAS$RowId == annoSetId]
+
+    # Handle possibility that _orig anno was used to create mx (e.g. annotation
+    # updated before matrix created.)
+    if(grepl("_orig", currAnnoNm)){
+      annoSetId <- currFAS$RowId[ currFAS$Name == gsub("_orig","", currAnnoNm)]
+    }
     sqlStr <- sprintf("SELECT FeatureAnnotationSetId, FeatureId, GeneSymbol
                     from FeatureAnnotation
                     where FeatureAnnotationSetId='%s';", annoSetId)
@@ -216,14 +251,17 @@ updateEMs <- function(sdy, runsDF){
                                   schemaName = "Microarray",
                                   sql = sqlStr,
                                   colNameOpt = "fieldname")
-    prbEM[ , V1 := as.character(V1)] # for SDY80 where probes have integer vals
-    prbEM <- prbEM[features, gene_symbol := GeneSymbol, on = c(V1 = "FeatureId")]
+    prbEM[ , feature_id := as.character(feature_id)] # for SDY80 where probes have integer vals
+    prbEM <- prbEM[features, gene_symbol := GeneSymbol, on = c(feature_id = "FeatureId")]
 
     # Summarize - lifted from Create-Matrix.R
     em <- prbEM[ !is.na(gene_symbol) & gene_symbol != "NA" ]
     sumEM <- em[ , lapply(.SD, mean), by="gene_symbol", .SDcols = grep("^BS", colnames(em)) ]
 
-    write.table(sumEM, file = paste0(dirPath, "/", nm, ".tsv.summary"), sep = "\t")
+    write.table(sumEM, file = paste0(dirPath, "/", nm, ".tsv.summary"),
+                sep = "\t",
+                row.names = FALSE,
+                quote = FALSE)
   })
   return(TRUE)
 }
@@ -239,43 +277,53 @@ updateEMs <- function(sdy, runsDF){
 #                              colNameOpt = "fieldname",
 #                              showHidden = TRUE)
 
-# This method is based on the DGEA.Rmd found in the DGEA module
+# This method is based on the DEA.Rmd found in the DEA module
 
 #' @export updateGEAR
 updateGEAR <- function(sdy, baseUrl, runsDF){
   print(paste0("working on study: ", sdy))
   infostring <- ""
-  labkey.url.base <- baseUrl
   contrast <- c("study_time_collected", "study_time_collected_unit")
-  con <- CreateConnection(sdy)
-  con$GeneExpressionInputs()
+  labkey.url.base <- baseUrl
+  labkey.url.path <- paste0("/Studies/", sdy)
+  # can't use CreateConnection() b/c lup/lub not in global env
+  con <- CreateConnection(study = sdy, onTest = grepl("test", baseUrl))
+  con$getGEInputs()
   GEA_list <- vector("list")
   GEAR_list <- vector("list")
 
   runs <- runsDF$name[ runsDF$folder_name == sdy ]
 
   idx <- 1 # analysis accession key
-  for(run in runs){
-    print(paste0("working on run: ", run))
-    EM <- con$getGEMatrix(run, outputType = "normalized", annotation = "latest") # note params!
+  for (run in runs) {
+
+    EM <- con$getGEMatrix(matrixName = run, outputType = "normalized", annotation = "latest")
     pd <- data.table(pData(EM))
     pd <- pd[, coef := do.call(paste, .SD), .SDcols = contrast]
+    if( length(unique(pd$coef)) < 2){
+      message(paste0(run, " has only one timepoint! Skipping."))
+      next()
+    }
     to_drop <- unique(pd[study_time_collected <= 0, coef])
     pd <- pd[coef %in% to_drop, coef := "baseline"]
-    pd <- pd[, coef := factor(coef, levels = c("baseline",
-                                               grep("baseline",
-                                                    value = TRUE,
-                                                    invert = TRUE,
-                                                    mixedsort(unique(coef)))))]
+    tmp <- grep("baseline", value = TRUE, invert = TRUE, mixedsort(unique(pd$coef)))
+    pd <- pd[, coef := factor(coef, levels = c("baseline", tmp))] # preps coef col for use in model
+    mm <- model.matrix(formula("~participant_id + coef"), pd)
 
-    # pd$coefs are timepoints so if only 1 then can't do differential
-    if( length(unique(pd$coef)) > 1 ){
-      mm <- model.matrix(formula("~participant_id + coef"), pd)
-
-      # Check if it's RNA-seq or microarrays
-      if( max(exprs(EM)) > 100 ){ EM <- voom(EM) }
+    if(dim(mm)[[1]] > dim(mm)[[2]]){
+      # Check if it's non-normalized and use na.rm = T b/c currently allowing NAs to remain
+      # in matrices in pipeline unless normalization doesn't work (e.g. DEseq)
+      if (max(Biobase::exprs(EM), na.rm = TRUE) > 100) { EM <- voom(EM) }
       fit <- lmFit(EM, mm)
-      fit <- eBayes(fit)
+      fit <- tryCatch(
+        eBayes(fit),
+        error = function(e) return(e)
+      )
+
+      if( !is.null(fit$message) ){
+        message(paste0("Linear model not able to be fit for ", run, ". Skipping to next matrix"))
+        next()
+      }
 
       # Prep for coefficients work
       cm <- con$getDataset("cohort_membership")
@@ -283,12 +331,21 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
       coefs <- grep("^coef", colnames(mm), value = TRUE)
 
       for(coef in coefs){
+
+        # Check that coef can be used
+        tt <- data.table(topTable(fit, coef = coef, number = Inf))
+        if(all(is.na(tt$adj.P.Val))){
+          message(paste0(coef, " has all NA values for adj.P.Val. Skipping to next coef."))
+          next()
+        }
+
         analysis_accession <- paste0("GEA", idx)
         TP <- gsub("coef", "", coef)
         arm_name <- unique(pData(EM)$cohort)
         arm_accession <- cm[cohort == arm_name, arm_accession]
         arm_name[ is.null(arm_name) ] <- NA
         description <- paste0("Differential expression in ", run, ", ", TP, " vs. baseline")
+
 
         GEA_list[[idx]] <- data.table(analysis_accession = analysis_accession,
                                       expression_matrix = run,
@@ -297,9 +354,7 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
                                       coefficient = gsub("^coef", "", coef),
                                       description = description)
 
-        tt <- data.table(topTable(fit, coef = coef, number = Inf))
-
-        tt <- if( sum(tt$adj.P.Val < 0.02) < 100 ){
+        tt <- if( sum(tt$adj.P.Val < 0.02, na.rm = T) < 100 ){
                 tt[order(adj.P.Val)][1:min(nrow(tt), 100)]
               }else{
                 tt[adj.P.Val < 0.02]
@@ -310,10 +365,11 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
           tt[, coefficient := gsub("coef","", coefficient) ]
           GEAR_list[[idx]] <- data.table(tt)
         }
+
+        idx <- idx + 1
       }
-      idx <- idx + 1
     }else{
-      print("lengths(coefs) < 2 therefore no differential")
+      message("Run ", run, " does not have enough subjects to perform analysis.")
     }
   }
 
@@ -325,12 +381,19 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
     queryRes <- "gene_expression_analysis_results"
 
     # delete old GEA
-    currGEA <- labkey.selectRows(baseUrl = baseUrl,
+    currGEA <- tryCatch(labkey.selectRows(baseUrl = baseUrl,
                                  folderPath = folderPath,
                                  schemaName = schemaGE,
                                  queryName = queryGEA,
                                  colNameOpt = "rname",
-                                 showHidden = T)
+                                 showHidden = T),
+                        error = function(e) return(e))
+
+    if( !is.null(currGEA$message) ){
+      message(paste0("Error: ", currGEA$message))
+      stop("May need to turn on DEA module to allow gene_expression schema.")
+    }
+
     if( nrow(currGEA) != 0 ){
       deleteGEA <- labkey.deleteRows(baseUrl = baseUrl,
                                      folderPath = folderPath,
@@ -424,8 +487,6 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
 
 #' @export runUpdateAnno
 runUpdateAnno <- function(baseUrl){
-  folderpath <- "/Studies/"
-
   # Double-check whether to run on test or prod
   chk <- readline(prompt = paste0("You are running on ",
                                   baseUrl,
@@ -436,6 +497,7 @@ runUpdateAnno <- function(baseUrl){
   # Update the secondary / updated FeatureAnnotation set
   updateFAS(baseUrl)
 
+  folderPath <- "/Studies/"
   # Get studies with gene expression matrices
   runsDF <- labkey.selectRows(baseUrl = baseUrl,
                               folderPath = folderPath,
