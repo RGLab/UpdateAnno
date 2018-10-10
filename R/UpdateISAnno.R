@@ -25,6 +25,7 @@
 
 # NOTE: Main Script @ bottom of page
 #' @import Rlabkey
+#' @import data.table
 #' @import org.Hs.eg.db
 #' @import ImmuneSpaceR
 #' @import limma
@@ -43,10 +44,9 @@
 # populating the probe level gene symbols with the arg: `annotation = "default"`.
 
 #' @export updateFAS
-updateFAS <- function(baseUrl){
+updateFAS <- function(baseUrl, folderPath = "/Studies/"){
 
   # vars ---------------------------------------------------
-  folderPath <- "/Studies/"
   schemaName <- "Microarray"
 
   # helper fn ----------------------------------------------
@@ -190,13 +190,14 @@ updateFAS <- function(baseUrl){
 
 
 #' @export updateEMs
-updateEMs <- function(sdy, runsDF){
+updateEMs <- function(sdy, runsDF, folderPath = "/Studies/"){
   print(paste0("working on study: ", sdy))
 
   # get file basenames present on server
-  dirPath <- file.path("/share/files/Studies",
-                       sdy,
-                       "@files/analysis/exprs_matrices")
+  sdyPath <- ifelse( folderPath == "/Studies/",
+                     paste0(folderPath, sdy),
+                     folderPath)
+  dirPath <- paste0("/share/files", sdyPath, "/@files/analysis/exprs_matrices")
   fls <- list.files(dirPath)
   tmp <- unique(unlist(strsplit(fls, split = ".tsv", fixed = TRUE)))
   baseNms <- tmp[ !(tmp %in% c(".summary",".summary.orig", ".raw", ".immsig")) ]
@@ -279,19 +280,19 @@ updateEMs <- function(sdy, runsDF){
 
 # This method is based on the DEA.Rmd found in the DEA module
 
+
 #' @export updateGEAR
-updateGEAR <- function(sdy, baseUrl, runsDF){
-  print(paste0("working on study: ", sdy))
-  infostring <- ""
-  contrast <- c("study_time_collected", "study_time_collected_unit")
-  labkey.url.base <- baseUrl
-  labkey.url.path <- paste0("/Studies/", sdy)
+updateGEAR <- function(sdy, baseUrl){
+
+  # NOT designed for use in HIPC-ISx studies!
 
   # can't use CreateConnection() b/c lup/lub not in global env
+  # since being run within a function
   con <- CreateConnection(study = sdy, onTest = grepl("test", baseUrl))
   con$getGEInputs()
-
+  contrast <- c("study_time_collected", "study_time_collected_unit")
   coefs <- unique(con$cache$GE_inputs[, c("arm_name", contrast), with = FALSE])
+
   if( !any(coefs$study_time_collected <= 0) ){
     message("No baseline timepoints available in any cohort. Analysis not run.")
     return()
@@ -305,13 +306,14 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
   GEA_list <- vector("list")
   GEAR_list <- vector("list")
 
-  runs <- runsDF$name[ runsDF$folder_name == sdy ]
+  runs <- con$cache$GE_matrices$name
+  gef <- con$getDataset("gene_expression_files", original_view = T)
 
   idx <- 1 # analysis accession key
   for (run in runs) {
 
-    EM <- con$getGEMatrix(matrixName = run, outputType = "normalized", annotation = "latest")
-    pd <- data.table(pData(EM))
+    ES <- con$getGEMatrix(matrixName = run, outputType = "normalized", annotation = "latest")
+    pd <- data.table(pData(ES))
     pd <- pd[, coef := do.call(paste, .SD), .SDcols = contrast]
     if( length(unique(pd$coef)) < 2){
       message(paste0(run, " has only one timepoint! Skipping."))
@@ -326,7 +328,11 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
     if(dim(mm)[[1]] > dim(mm)[[2]]){
       # Check if it's non-normalized and use na.rm = T b/c currently allowing NAs to remain
       # in matrices in pipeline unless normalization doesn't work (e.g. DEseq)
-      if (max(Biobase::exprs(EM), na.rm = TRUE) > 100) { EM <- voom(EM) }
+      if (max(Biobase::exprs(ES), na.rm = TRUE) > 100) {
+        EM <- voom(ES)
+      }else{
+        EM <- ES
+      }
       fit <- lmFit(EM, mm)
       fit <- tryCatch(
         eBayes(fit),
@@ -343,6 +349,10 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
       cm <- unique( cm[, list(cohort, arm_accession)] )
       coefs <- grep("^coef", colnames(mm), value = TRUE)
 
+      # create cohort_type identifier so unique to runs, which are cohort * cell_type
+      gefSub <- gef[ gef$biosample_accession %in% pd$biosample_accession, ]
+      cohort_type <- unique(paste(gefSub$cohort, gefSub$type, sep = "_"))
+
       for(coef in coefs){
 
         # Check that coef can be used
@@ -354,15 +364,14 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
 
         analysis_accession <- paste0("GEA", idx)
         TP <- gsub("coef", "", coef)
-        arm_name <- unique(pData(EM)$cohort)
-        arm_accession <- cm[cohort == arm_name, arm_accession]
-        arm_name[ is.null(arm_name) ] <- NA
+        arm_accession <- cm[cohort == unique(pData(ES)$cohort), arm_accession]
+        # arm_name[ is.null(arm_name) ] <- NA
         description <- paste0("Differential expression in ", run, ", ", TP, " vs. baseline")
 
 
         GEA_list[[idx]] <- data.table(analysis_accession = analysis_accession,
                                       expression_matrix = run,
-                                      arm_name = arm_name,
+                                      arm_name = cohort_type,
                                       arm_accession = arm_accession,
                                       coefficient = gsub("^coef", "", coef),
                                       description = description)
@@ -388,7 +397,7 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
 
   if( length(GEA_list) > 0 ){
     # Set HTTP call vars
-    folderPath <- con$config$labkey.url.path
+    folderPath <- con$config$labkey.url.path # must be sdy-specific
     schemaGE <- "gene_expression"
     queryGEA <- "gene_expression_analysis"
     queryRes <- "gene_expression_analysis_results"
@@ -473,7 +482,7 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
                                    toImport = toImport)
     }
   }
-  return(TRUE)
+  return(newGEA)
 }
 
 #######################################################################
@@ -499,7 +508,14 @@ updateGEAR <- function(sdy, baseUrl, runsDF){
 #######################################################################
 
 #' @export runUpdateAnno
-runUpdateAnno <- function(baseUrl){
+runUpdateAnno <- function(ISserver, folderPath = "/Studies/"){
+
+  # NOTES: expects folderPath for ISx studies of "/HIPC/ISx/"
+
+  baseUrl <- ifelse( ISserver == "prod",
+                     "https://www.immunespace.org",
+                     "https://test.immunespace.org")
+
   # Double-check whether to run on test or prod
   chk <- readline(prompt = paste0("You are running on ",
                                   baseUrl,
@@ -508,9 +524,8 @@ runUpdateAnno <- function(baseUrl){
   if( !(chk %in% c("", "t", "T")) ){ return("Operations ended.") }
 
   # Update the secondary / updated FeatureAnnotation set
-  updateFAS(baseUrl)
+  updateFAS(baseUrl, folderPath)
 
-  folderPath <- "/Studies/"
   # Get studies with gene expression matrices
   runsDF <- labkey.selectRows(baseUrl = baseUrl,
                               folderPath = folderPath,
@@ -518,8 +533,12 @@ runUpdateAnno <- function(baseUrl){
                               queryName = "Runs",
                               colNameOpt = "rname")
   sdys <- unique(runsDF$folder_name)
-  lapply(sdys, updateEMs, runsDF = runsDF) # update flat files for summary only
-  lapply(sdys, updateGEAR, baseUrl = baseUrl, runsDF = runsDF) # using con$getGEMatrix(outputType = "normalized", annotation = "latest")
+
+  # update flat files for summary only
+  lapply(sdys, updateEMs, runsDF = runsDF, folderPath = folderPath)
+
+  # using con$getGEMatrix(outputType = "normalized", annotation = "latest")
+  dmp <- lapply(sdys, updateGEAR, baseUrl = baseUrl)
 }
 
 
